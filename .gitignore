@@ -1,0 +1,12 @@
+/target/
+*.db
+*.db-*
+*.jsonl
+*.zst
+*.pb
+*.pbtxt
+/.codex/
+/.claude/
+/.gemini/
+*.sqlite
+*.sqlite-*

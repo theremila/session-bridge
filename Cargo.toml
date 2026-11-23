@@ -1,0 +1,8 @@
+[package]
+name = "session-bridge"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+description = "Local transcript migration between Codex CLI, Antigravity CLI, and Claude Code"
