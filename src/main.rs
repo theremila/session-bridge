@@ -38,6 +38,94 @@ struct Session<'a> {
     messages: Vec<Message<'a>>,
 }
 
+fn context_title(value: &str) -> bool {
+    let value = value.trim_start();
+    [
+        "<environment_context",
+        "# AGENTS.md instructions",
+        "<external_codex_apps_open_page",
+        "<codex_internal_context",
+        "<guardian_tool_descriptions",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn clean_title(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(240)
+        .collect()
+}
+
+fn normalize_name(raw: &str) -> String {
+    clean_title(raw).to_lowercase()
+}
+
+fn usable_title(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty() && !context_title(trimmed)).then_some(trimmed)
+}
+
+impl Session<'_> {
+    fn prompt_preview(&self) -> String {
+        self.messages
+            .iter()
+            .find(|m| m.user)
+            .unwrap_or(&self.messages[0])
+            .text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Imported conversation")
+            .trim()
+            .chars()
+            .take(100)
+            .collect()
+    }
+
+    fn display_title(&self) -> String {
+        if let Some(title) = self.title.as_deref().and_then(usable_title) {
+            clean_title(title)
+        } else {
+            clean_title(&self.prompt_preview())
+        }
+    }
+}
+
+struct NameFilter {
+    targets: Vec<String>,
+}
+
+impl NameFilter {
+    fn new(names: Vec<String>) -> Self {
+        let targets = names
+            .into_iter()
+            .map(|name| normalize_name(&name))
+            .collect();
+        Self { targets }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.targets.is_empty()
+    }
+
+    fn matches_title(&self, title: &str) -> bool {
+        if self.targets.is_empty() {
+            return true;
+        }
+        let candidate = normalize_name(title);
+        self.targets.iter().any(|target| target == &candidate)
+    }
+
+    fn matches_session(&self, session: &Session<'_>) -> bool {
+        if self.targets.is_empty() {
+            return true;
+        }
+        self.matches_title(&session.display_title())
+    }
+}
+
 fn uuid(s: &str) -> bool {
     s.len() == 36
         && s.bytes().enumerate().all(|(i, byte)| {
@@ -197,8 +285,9 @@ impl Format {
 
 fn usage() {
     println!(
-        "session-bridge --from FORMAT --to FORMAT [--dry-run] [--include-internal]\n\
+        "session-bridge --from FORMAT --to FORMAT [--name TITLE]... [--dry-run] [--include-internal]\n\
         Formats: codex, agy (antigravity), claude (claude-code)\n\
+        --name, -n TITLE: migrate only sessions matching this title (repeatable)\n\
         --include-internal: include Codex subagent and Guardian conversations\n\
         Store overrides: --codex-dir PATH, --agy-dir PATH, --claude-dir PATH"
     );
@@ -208,6 +297,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mut from = None;
     let mut to = None;
+    let mut names = Vec::new();
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
     let mut codex_dir = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -234,6 +324,16 @@ fn run() -> Result<()> {
             Some("--to" | "-to") if to.is_none() => {
                 to = Some(Format::parse(&args.next().ok_or("missing --to value")?)?);
             }
+            Some("--name" | "-name" | "-n") => {
+                let raw = args.next().ok_or("missing --name value")?;
+                let value = raw
+                    .into_string()
+                    .map_err(|_| "--name must be valid UTF-8")?;
+                if value.trim().is_empty() {
+                    return Err("--name cannot be empty".into());
+                }
+                names.push(value);
+            }
             Some("--codex-dir") => {
                 codex_dir = args.next().ok_or("missing --codex-dir value")?.into()
             }
@@ -256,6 +356,7 @@ fn run() -> Result<()> {
         return Err("--include-internal requires --from codex".into());
     }
 
+    let filter = NameFilter::new(names);
     let existing = match to {
         Format::Codex => codex::existing_ids(&codex_dir)?,
         Format::Claude => claude::existing_ids(&claude_dir)?,
@@ -275,9 +376,9 @@ fn run() -> Result<()> {
         println!("Dry run. Converted count is projected.");
     }
     match from {
-        Format::Codex => codex::read_all(&codex_dir, include_internal, &mut convert),
-        Format::Agy => antigravity::read_all(&agy_dir, &home, &mut convert),
-        Format::Claude => claude::read_all(&claude_dir, &home, &mut convert),
+        Format::Codex => codex::read_all(&codex_dir, include_internal, &filter, &mut convert),
+        Format::Agy => antigravity::read_all(&agy_dir, &home, &filter, &mut convert),
+        Format::Claude => claude::read_all(&claude_dir, &home, &filter, &mut convert),
     }
 }
 

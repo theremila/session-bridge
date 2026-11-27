@@ -1,5 +1,6 @@
 use super::*;
 use crate::proto::{bytes, get, integer, number, replace_bytes};
+use std::collections::HashMap;
 use std::io::Read;
 
 const APPLICATION_ID: u32 = 1396855367;
@@ -16,46 +17,14 @@ fn imported(path: &Path) -> Result<bool> {
     }
 }
 
-fn prompt_preview(session: &Session<'_>) -> String {
-    session
-        .messages
-        .iter()
-        .find(|m| m.user)
-        .unwrap_or(&session.messages[0])
-        .text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("Imported conversation")
-        .trim()
-        .chars()
-        .take(100)
-        .collect()
-}
-
-fn context_title(value: &str) -> bool {
-    let value = value.trim_start();
-    [
-        "<environment_context",
-        "# AGENTS.md instructions",
-        "<external_codex_apps_open_page",
-        "<codex_internal_context",
-        "<guardian_tool_descriptions",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
-}
-
 fn title(session: &Session<'_>, preview: &str) -> String {
-    session
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty() && !context_title(text))
-        .unwrap_or(preview)
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(240)
-        .collect()
+    clean_title(
+        session
+            .title
+            .as_deref()
+            .and_then(usable_title)
+            .unwrap_or(preview),
+    )
 }
 
 fn annotation(root: &Path, id: &str, title: &str) -> Result<bool> {
@@ -80,6 +49,59 @@ fn native_date(iso: &str) -> String {
     date.replace('T', " ") + "+00:00"
 }
 
+fn parse_hex4(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    let mut value = 0u16;
+    for _ in 0..4 {
+        let digit = chars.next()?.to_digit(16)? as u16;
+        value = (value << 4) | digit;
+    }
+    Some(value)
+}
+
+fn unescape_json_string(literal: &str) -> Option<String> {
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let code = parse_hex4(&mut chars)?;
+                    if (0xD800..=0xDBFF).contains(&code) {
+                        if chars.next()? != '\\' || chars.next()? != 'u' {
+                            return None;
+                        }
+                        let low = parse_hex4(&mut chars)?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return None;
+                        }
+                        let combined =
+                            0x10000 + ((u32::from(code - 0xD800) << 10) | u32::from(low - 0xDC00));
+                        out.push(char::from_u32(combined)?);
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        return None;
+                    } else {
+                        out.push(char::from_u32(u32::from(code))?);
+                    }
+                }
+                _ => return None,
+            },
+            '"' => return None,
+            c if c < '\u{20}' => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 fn read_annotation(path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(path)?;
     let Some(literal) = content
@@ -90,15 +112,7 @@ fn read_annotation(path: &Path) -> Result<Option<String>> {
     };
     // Go's prototext writes quoted strings. JSON covers the escape sequences
     // used in normal titles. Leave other native annotations untouched.
-    let result = sqlite(
-        Path::new(":memory:"),
-        &format!(
-            "SELECT CASE WHEN json_valid({0}) THEN hex(json_extract({0}, '$')) END;\n",
-            sql_text(literal)
-        ),
-        false,
-    )?;
-    Ok(Some(String::from_utf8(unhex(result.trim())?)?).filter(|title| !title.is_empty()))
+    Ok(unescape_json_string(literal).filter(|title| !title.is_empty()))
 }
 
 fn indexed_dates(path: &Path) -> Result<Vec<String>> {
@@ -208,7 +222,7 @@ fn repair_existing(
     };
     let old_title = String::from_utf8(unhex(old_title_hex)?)?;
     let old_preview = String::from_utf8(unhex(old_preview_hex)?)?;
-    let preview = prompt_preview(session);
+    let preview = session.prompt_preview();
     let annotation_path = root.join("annotations").join(format!("{id}.pbtxt"));
     let has_annotation = annotation_path.try_exists()?;
     let old_title_missing = old_title.trim().is_empty() || context_title(&old_title);
@@ -436,7 +450,7 @@ pub fn write(root: &Path, session: &Session<'_>, dry_run: bool) -> Result<bool> 
         return Ok(false);
     }
 
-    let preview = prompt_preview(session);
+    let preview = session.prompt_preview();
     let title = title(session, &preview);
     annotation(root, id, &title)?;
     let mut summary = Vec::new();
@@ -485,7 +499,57 @@ fn decode_time(input: &[u8]) -> Result<(u64, u64)> {
     Ok((integer(input, 1)?, integer(input, 2)?))
 }
 
-fn read(path: &Path, id: &str, home: &Path) -> Result<Option<Session<'static>>> {
+fn load_titles(root: &Path) -> Result<HashMap<String, String>> {
+    let mut titles = HashMap::new();
+    let index = root.join("conversation_summaries.db");
+    if index.try_exists()? {
+        let tables = sqlite(
+            &index,
+            "SELECT name FROM sqlite_master WHERE name='conversation_summaries';\n",
+            true,
+        )?;
+        if tables.lines().any(|s| s == "conversation_summaries") {
+            let rows = sqlite(
+                &index,
+                "SELECT conversation_id, hex(title) FROM conversation_summaries WHERE length(trim(title)) > 0;\n",
+                true,
+            )?;
+            for (id, value) in rows.lines().filter_map(|row| row.split_once('\t')) {
+                if uuid(id) {
+                    titles.insert(id.to_owned(), String::from_utf8(unhex(value)?)?);
+                }
+            }
+        }
+    }
+    let annotations = root.join("annotations");
+    if annotations.try_exists()? {
+        for entry in fs::read_dir(&annotations)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".pbtxt"))
+                .filter(|s| uuid(s))
+            else {
+                continue;
+            };
+            if let Ok(Some(value)) = read_annotation(&entry.path()) {
+                titles.insert(id.to_owned(), value);
+            }
+        }
+    }
+    Ok(titles)
+}
+
+fn read(
+    path: &Path,
+    id: &str,
+    home: &Path,
+    title: Option<String>,
+) -> Result<Option<Session<'static>>> {
     let metadata = sqlite(
         path,
         "SELECT hex(data) FROM trajectory_metadata_blob WHERE id='main';\n",
@@ -540,7 +604,7 @@ fn read(path: &Path, id: &str, home: &Path) -> Result<Option<Session<'static>>> 
         id: id.to_owned(),
         time: messages[0].time.to_string(),
         cwd,
-        title: None,
+        title,
         messages,
     }))
 }
@@ -548,6 +612,7 @@ fn read(path: &Path, id: &str, home: &Path) -> Result<Option<Session<'static>>> 
 pub fn read_all(
     root: &Path,
     home: &Path,
+    filter: &NameFilter,
     mut convert: impl FnMut(&Session<'_>) -> Result<bool>,
 ) -> Result<()> {
     let path = root.join("conversations");
@@ -562,7 +627,9 @@ pub fn read_all(
         &mut entries,
     )?;
     entries.sort();
-    let (mut written, mut existing, mut empty, mut legacy, mut failed) = (0, 0, 0, 0, 0);
+    let mut titles = load_titles(root)?;
+    let (mut written, mut existing, mut empty, mut legacy, mut filtered, mut failed) =
+        (0, 0, 0, 0, 0, 0);
     for entry in entries {
         if entry.extension().is_some_and(|ext| ext == "pb") {
             if !entry.with_extension("db").try_exists()? {
@@ -574,11 +641,31 @@ pub fn read_all(
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or("missing conversation ID")?;
-        match read(&entry, id, home)
-            .and_then(|session| session.as_ref().map(&mut convert).transpose())
+        let title = titles.remove(id);
+        if filter.is_active()
+            && title
+                .as_deref()
+                .and_then(usable_title)
+                .is_some_and(|value| !filter.matches_title(value))
         {
-            Ok(Some(true)) => written += 1,
-            Ok(Some(false)) => existing += 1,
+            filtered += 1;
+            continue;
+        }
+        match read(&entry, id, home, title) {
+            Ok(Some(session)) => {
+                if !filter.matches_session(&session) {
+                    filtered += 1;
+                    continue;
+                }
+                match convert(&session) {
+                    Ok(true) => written += 1,
+                    Ok(false) => existing += 1,
+                    Err(e) => {
+                        eprintln!("{id}: {e}");
+                        failed += 1;
+                    }
+                }
+            }
             Ok(None) => empty += 1,
             Err(e) => {
                 eprintln!("{id}: {e}");
@@ -586,11 +673,20 @@ pub fn read_all(
             }
         }
     }
-    println!(
-        "{written} converted, {existing} already present, {empty} without text, {legacy} unsupported legacy .pb, {failed} failed."
-    );
+    if filter.is_active() {
+        println!(
+            "{written} converted, {existing} already present, {empty} without text, {legacy} unsupported legacy .pb, {filtered} filtered, {failed} failed."
+        );
+    } else {
+        println!(
+            "{written} converted, {existing} already present, {empty} without text, {legacy} unsupported legacy .pb, {failed} failed."
+        );
+    }
     if failed > 0 {
         return Err("some conversations could not be imported".into());
+    }
+    if filter.is_active() && written + existing == 0 {
+        return Err("no sessions matched --name".into());
     }
     Ok(())
 }

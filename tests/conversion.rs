@@ -715,3 +715,172 @@ fn invalid_timestamp_fails_both_dry_run_and_import_before_writing() {
         assert!(!result.status.success() && !agy.exists());
     }
 }
+
+#[test]
+fn name_filter_migrates_only_matching_sessions_across_all_sources() {
+    let scratch = Scratch::new();
+    let codex = scratch.path("codex");
+    let agy = scratch.path("agy");
+    let claude = scratch.path("claude");
+
+    let second_id = "82f06ba2-26cc-45bc-b811-782ba89291e2";
+    let third_id = "82f06ba2-26cc-45bc-b811-782ba89291e3";
+    codex_fixture(&codex, false, true);
+    write(
+        codex.join(format!(
+            "sessions/2026/01/01/rollout-2026-01-01T10-00-02-{second_id}.jsonl"
+        )),
+        format!(
+            "{}\n{}\n{}\n",
+            format_args!(
+                r#"{{"timestamp":"{START}","type":"session_meta","payload":{{"id":"{second_id}","timestamp":"{START}","cwd":"{WORKSPACE}"}}}}"#
+            ),
+            codex_record("user", START, r#""Second chat prompt""#),
+            codex_record("assistant", END, r#""Second chat reply""#)
+        ),
+    );
+    write(
+        codex.join(format!(
+            "sessions/2026/01/01/rollout-2026-01-01T10-00-03-{third_id}.jsonl"
+        )),
+        format!(
+            "{}\n{}\n",
+            format_args!(
+                r#"{{"timestamp":"{START}","type":"session_meta","payload":{{"id":"{third_id}","timestamp":"{START}","cwd":"{WORKSPACE}"}}}}"#
+            ),
+            codex_record("user", START, r#""Fallback preview title\nSecond line""#)
+        ),
+    );
+    let mut index = fs::read_to_string(codex.join("session_index.jsonl")).unwrap();
+    index.push_str(&format!(
+        "{{\"id\":\"{second_id}\",\"thread_name\":\"Серверная миграция\",\"updated_at\":\"{END}\"}}\n"
+    ));
+    fs::write(codex.join("session_index.jsonl"), index).unwrap();
+
+    // Codex -> Agy: single --name (case-insensitive Unicode) + dry-run + idempotency
+    let dry = bridge(
+        "codex",
+        &codex,
+        "agy",
+        &agy,
+        &["--dry-run", "--name", "  серверная миграция  "],
+    );
+    assert!(
+        dry.contains("1 converted") && dry.contains("2 filtered") && !agy.exists(),
+        "{dry}"
+    );
+
+    let single = bridge("codex", &codex, "agy", &agy, &["-n", "серверная миграция"]);
+    assert!(
+        single.contains("1 converted") && single.contains("2 filtered"),
+        "{single}"
+    );
+    assert!(agy.join(format!("conversations/{second_id}.db")).exists());
+    assert!(!agy_db(&agy).exists());
+    assert!(!agy.join(format!("conversations/{third_id}.db")).exists());
+
+    // Rerun with same --name succeeds as already present
+    let rerun = bridge(
+        "codex",
+        &codex,
+        "agy",
+        &agy,
+        &["--name", "Серверная миграция"],
+    );
+    assert!(
+        rerun.contains("0 converted") && rerun.contains("1 already present"),
+        "{rerun}"
+    );
+
+    // Codex -> Agy: repeatable --name including fallback preview title
+    let multi = bridge(
+        "codex",
+        &codex,
+        "agy",
+        &agy,
+        &["--name", TITLE, "--name", "fallback preview title"],
+    );
+    assert!(
+        multi.contains("2 converted") && multi.contains("1 filtered"),
+        "{multi}"
+    );
+    assert!(agy_db(&agy).exists());
+    assert!(agy.join(format!("conversations/{third_id}.db")).exists());
+
+    // Agy -> Claude: filter by title stored in Antigravity annotation/summaries
+    let from_agy = bridge(
+        "agy",
+        &agy,
+        "claude",
+        &claude,
+        &["--name", &TITLE.to_uppercase()],
+    );
+    assert!(
+        from_agy.contains("1 converted") && from_agy.contains("2 filtered"),
+        "{from_agy}"
+    );
+    assert_json_transcript(&claude, "claude");
+
+    // Claude -> Codex: custom-title and summary matching
+    let claude_src = scratch.path("claude-named");
+    let codex_dst = scratch.path("codex-dst");
+    write(
+        claude_src.join(format!("projects/synthetic/{ID}.jsonl")),
+        format!(
+            r#"{{"type":"user","timestamp":"{START}","cwd":"{WORKSPACE}","sessionId":"{ID}","message":{{"content":{USER_JSON}}}}}
+{{"type":"assistant","timestamp":"{END}","message":{{"content":[{{"type":"text","text":{REPLY_JSON}}}]}}}}
+{{"type":"summary","summary":"Auto summary"}}
+{{"type":"custom-title","customTitle":"Renamed in Claude","sessionId":"{ID}"}}
+"#
+        ),
+    );
+    write(
+        claude_src.join(format!("projects/synthetic/{second_id}.jsonl")),
+        format!(
+            r#"{{"type":"user","timestamp":"{START}","cwd":"{WORKSPACE}","sessionId":"{second_id}","message":{{"content":"Other session"}}}}
+{{"type":"summary","summary":"Other summary"}}
+"#
+        ),
+    );
+    let from_claude = bridge(
+        "claude",
+        &claude_src,
+        "codex",
+        &codex_dst,
+        &["--name", "renamed in claude"],
+    );
+    assert!(
+        from_claude.contains("1 converted") && from_claude.contains("1 filtered"),
+        "{from_claude}"
+    );
+    assert_json_transcript(&codex_dst, "codex");
+}
+
+#[test]
+fn name_filter_errors_on_empty_or_unmatched_title() {
+    let scratch = Scratch::new();
+    let codex = scratch.path("codex");
+    let agy = scratch.path("agy");
+    codex_fixture(&codex, false, true);
+
+    for args in [
+        &["--name", "   "][..],
+        &["--name", "Does not exist"][..],
+        &["--dry-run", "--name", "Does not exist"][..],
+    ] {
+        let result = output(
+            Command::new(env!("CARGO_BIN_EXE_session-bridge"))
+                .args(["--from", "codex", "--to", "agy", "--codex-dir"])
+                .arg(&codex)
+                .arg("--agy-dir")
+                .arg(&agy)
+                .args(args),
+        );
+        assert!(
+            !result.status.success() && !agy.exists(),
+            "expected failure for {args:?}, got stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

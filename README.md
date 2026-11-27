@@ -15,8 +15,9 @@ cargo build --release --locked
 ```sh
 ./target/release/session-bridge --from claude --to codex --dry-run
 ./target/release/session-bridge --from claude --to codex
+./target/release/session-bridge --from claude --to codex --name "Session title"
 ```
 
-Use any pair of `codex`, `agy`, and `claude`. A dry run previews the import without changing chat history.
+Use any pair of `codex`, `agy`, and `claude`. Omit `--name` to migrate all sessions, or pass `--name` (`-n`) one or more times to migrate only matching titles. A dry run previews the import without changing chat history.
 
 The converter copies text, timestamps, and working directories. Attachments and tool history stay in the source. Run `./target/release/session-bridge --help` for custom storage paths.

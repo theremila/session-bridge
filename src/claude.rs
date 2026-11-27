@@ -44,16 +44,35 @@ fn read(path: &Path, id: String, home: &Path) -> Result<Option<Session<'static>>
     }
     let mut messages = Vec::new();
     let mut cwd = None;
+    let mut custom_title = None;
+    let mut summary_title = None;
     let output = String::from_utf8(output.stdout)?;
     for row in output.lines() {
         let mut fields = row.splitn(4, '\t');
         let role = fields.next().ok_or("missing Claude message role")?;
-        let time = fields
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or("missing Claude message timestamp")?;
+        let time = fields.next().ok_or("missing Claude message timestamp")?;
         let workspace = unescape_tsv(fields.next().ok_or("missing Claude project field")?);
         let text = unescape_tsv(fields.next().ok_or("missing Claude message text")?);
+        match role {
+            "title" => {
+                if !text.trim().is_empty() {
+                    custom_title = Some(text);
+                }
+                continue;
+            }
+            "summary" => {
+                if !text.trim().is_empty() {
+                    summary_title = Some(text);
+                }
+                continue;
+            }
+            "user" | "assistant" => {
+                if time.is_empty() {
+                    return Err("missing Claude message timestamp".into());
+                }
+            }
+            _ => return Err("unexpected Claude record role".into()),
+        }
         if cwd.is_none() && Path::new(&workspace).is_absolute() {
             cwd = Some(workspace);
         }
@@ -70,7 +89,7 @@ fn read(path: &Path, id: String, home: &Path) -> Result<Option<Session<'static>>
         time: first.time.to_string(),
         id,
         cwd: cwd.unwrap_or_else(|| home.to_string_lossy().into_owned()),
-        title: None,
+        title: custom_title.or(summary_title),
         messages,
     }))
 }
@@ -78,30 +97,41 @@ fn read(path: &Path, id: String, home: &Path) -> Result<Option<Session<'static>>
 pub fn read_all(
     root: &Path,
     home: &Path,
+    filter: &NameFilter,
     mut convert: impl FnMut(&Session<'_>) -> Result<bool>,
 ) -> Result<()> {
     let paths = transcripts(root)?;
     if paths.is_empty() {
         return Err(format!("no Claude Code transcripts in {}", root.display()).into());
     }
-    let (mut written, mut existing, mut empty, mut failed) = (0, 0, 0, 0);
+    let (mut written, mut existing, mut empty, mut filtered, mut failed) = (0, 0, 0, 0, 0);
     let mut seen = HashSet::new();
     for (id, path) in paths {
-        match read(&path, id, home).and_then(|session| {
-            session
-                .as_ref()
-                .map(|session| {
-                    if seen.contains(&session.id) {
-                        return Ok(false);
+        match read(&path, id, home) {
+            Ok(Some(session)) => {
+                if !filter.matches_session(&session) {
+                    filtered += 1;
+                    continue;
+                }
+                if seen.contains(&session.id) {
+                    existing += 1;
+                    continue;
+                }
+                match convert(&session) {
+                    Ok(true) => {
+                        seen.insert(session.id);
+                        written += 1;
                     }
-                    let result = convert(session)?;
-                    seen.insert(session.id.clone());
-                    Ok(result)
-                })
-                .transpose()
-        }) {
-            Ok(Some(true)) => written += 1,
-            Ok(Some(false)) => existing += 1,
+                    Ok(false) => {
+                        seen.insert(session.id);
+                        existing += 1;
+                    }
+                    Err(error) => {
+                        eprintln!("{}: {error}", path.display());
+                        failed += 1;
+                    }
+                }
+            }
             Ok(None) => empty += 1,
             Err(error) => {
                 eprintln!("{}: {error}", path.display());
@@ -109,11 +139,20 @@ pub fn read_all(
             }
         }
     }
-    println!(
-        "{written} converted, {existing} already present, {empty} without text, {failed} failed."
-    );
+    if filter.is_active() {
+        println!(
+            "{written} converted, {existing} already present, {empty} without text, {filtered} filtered, {failed} failed."
+        );
+    } else {
+        println!(
+            "{written} converted, {existing} already present, {empty} without text, {failed} failed."
+        );
+    }
     if failed > 0 {
         return Err("some Claude Code transcripts could not be imported".into());
+    }
+    if filter.is_active() && written + existing == 0 {
+        return Err("no sessions matched --name".into());
     }
     Ok(())
 }

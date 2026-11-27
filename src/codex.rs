@@ -226,6 +226,7 @@ fn thread_index(root: &Path, classify: bool) -> Result<ThreadIndex> {
 pub fn read_all(
     root: &Path,
     include_internal: bool,
+    filter: &NameFilter,
     mut convert: impl FnMut(&Session<'_>) -> Result<bool>,
 ) -> Result<()> {
     let mut paths = rollout_paths(root)?;
@@ -287,10 +288,21 @@ pub fn read_all(
     let mut existing = 0;
     let mut empty = 0;
     let mut internal = 0;
+    let mut filtered = 0;
     for (id, (_, key)) in latest {
         let segment = &segments[&key];
         if index.internal.contains(&id) {
             internal += 1;
+            continue;
+        }
+        if filter.is_active()
+            && index
+                .titles
+                .get(&id)
+                .and_then(|title| usable_title(title))
+                .is_some_and(|title| !filter.matches_title(title))
+        {
+            filtered += 1;
             continue;
         }
         let mut messages = Vec::new();
@@ -316,6 +328,10 @@ pub fn read_all(
             cwd: segment.cwd.clone(),
             messages,
         };
+        if !filter.matches_session(&session) {
+            filtered += 1;
+            continue;
+        }
         match convert(&session) {
             Ok(true) => written += 1,
             Ok(false) => existing += 1,
@@ -325,12 +341,22 @@ pub fn read_all(
             }
         }
     }
-    println!(
-        "{} rollout files: {written} converted, {existing} already present, {empty} without text, {internal} internal skipped, {failed} failed.",
-        paths.len()
-    );
+    if filter.is_active() {
+        println!(
+            "{} rollout files: {written} converted, {existing} already present, {empty} without text, {internal} internal skipped, {filtered} filtered, {failed} failed.",
+            paths.len()
+        );
+    } else {
+        println!(
+            "{} rollout files: {written} converted, {existing} already present, {empty} without text, {internal} internal skipped, {failed} failed.",
+            paths.len()
+        );
+    }
     if failed > 0 {
         return Err("some rollouts could not be imported".into());
+    }
+    if filter.is_active() && written + existing == 0 {
+        return Err("no sessions matched --name".into());
     }
     Ok(())
 }
